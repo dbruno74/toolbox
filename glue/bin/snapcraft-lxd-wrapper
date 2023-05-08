@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# snapcraft_lxd_wrapper [local_snapcraft_snap] [init_file]
+
+if [ ! -z ${1} ]; then
+   LOCAL_SNAPCRAFT_SNAP=$(realpath ${1})
+else
+   LOCAL_SNAPCRAFT_SNAP=""
+fi
+
+if [ ! -z ${2} ]; then
+   INIT_FILE=$(realpath ${2})
+else
+   INIT_FILE=""
+fi
+
 # set script version, so we have some tracking
 LXD_SCRIPT_VERSION="0.1"
 IDENTITY_FILE="${HOME}/.ssh/id_rsa-lxd"
@@ -262,10 +276,12 @@ lxd_ensure_container () {
   lxc init ubuntu-daily:${ubuntu_series} ${container_name}
 
   echo "Configuring new container..."
-  # override template, as sometimes snapcraft tries to be too smart
+  # override template and sources.list, as sometimes snapcraft tries to be too smart
   local tmp_sources=$(mktemp -u -q)
   curl -s https://people.canonical.com/~okubik/sources.list.ubuntu.lxd.tmpl > ${tmp_sources}
+  curl -s https://people.canonical.com/~okubik/sources-jammy.lxc.list  > ${tmp_sources}
   lxc file push ${tmp_sources} ${container_name}/etc/cloud/templates/sources.list.ubuntu.tmpl
+  lxc file push ${tmp_sources} ${container_name}/etc/apt/sources.list
   [ -e ${tmp_sources} ] && rm ${tmp_sources}
   echo -en "uid $(id -u) 1000\ngid $(id -g) 1000" | lxc config set ${container_name} raw.idmap -
   # check if kernel version is 5.x, enough to enable mknod interception, to support debootstrap
@@ -295,6 +311,17 @@ lxd_ensure_container () {
   # snapcraft 7.x does not like to run apt as root, setup wrappers if this jammy container
   if [ "${ubuntu_series}" == "jammy" ]; then
     local tmp_wrapper=$(mktemp -u -q)
+    tee ${tmp_wrapper} <<EOF
+#!/bin/sh
+# do not force sudo use for all the options as that can cause problems
+if [ "\${1}" = "login" ] || [ "\${1}" = "install" ] || [ "\${1}" = "download" ]; then
+  sudo /usr/bin/snap "\$@"
+else
+  /usr/bin/snap "\$@"
+fi
+EOF
+
+    lxc file push ${tmp_wrapper} ${container_name}/usr/local/bin/snap
     tee ${tmp_wrapper} <<EOF
 #!/bin/sh
 # do not force sudo use for all the options as that can cause problems
@@ -439,10 +466,23 @@ EOF
   if [ "${ubuntu_series}" == "xenial" ]; then
     lxc exec ${container_name} -- sh -c 'snap install snapcraft --classic --channel 4.x/stable'
   else
-    lxc exec ${container_name} -- sh -c 'snap install snapcraft --classic'
+    if [ -z ${LOCAL_SNAPCRAFT_SNAP} ]; then
+        lxc exec ${container_name} -- sh -c 'snap install snapcraft --classic'
+    else
+	# install the snapcraft snap passed as first argument
+	SH_CMD='snap install --dangerous /snapcraft.snap --classic'
+	lxc file push ${LOCAL_SNAPCRAFT_SNAP}  ${container_name}/snapcraft.snap
+    	lxc exec ${container_name} -- sh <<< ${SH_CMD}
+    fi
   fi
   if [ "${ubuntu_series}" == "jammy" ]; then
     lxc exec ${container_name} -- sh -c 'snap install core22'
+  fi
+  # execute init commands
+  if [ -z ${INIT_FILE} ]; then
+    echo "no init file provided" 
+  else
+	  lxc exec ${container_name} -- sh <<< $(cat ${INIT_FILE})
   fi
 }
 
